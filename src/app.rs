@@ -415,9 +415,11 @@ impl SShareApp {
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
         let cursor_in = ctx.input(|i| i.pointer.has_pointer());
 
+        let prev_monitor_h = self.monitor_h;
         if let Some(sz) = ctx.input(|i| i.viewport().monitor_size) {
             self.monitor_h = sz.y;
         }
+        let monitor_changed = (self.monitor_h - prev_monitor_h).abs() > 0.5;
 
         let prev_phase = self.phase;
 
@@ -495,7 +497,7 @@ impl SShareApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
             }
         }
-        if !self.initialized || self.phase != prev_phase || animating {
+        if !self.initialized || self.phase != prev_phase || animating || monitor_changed {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.window_pos()));
             self.initialized = true;
         }
