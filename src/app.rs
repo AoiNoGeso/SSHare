@@ -1,6 +1,7 @@
 use eframe::egui;
 use std::sync::mpsc;
 
+use crate::config::{Config, ConfigMode};
 use crate::network::SharedItem;
 use crate::protocol::Message;
 
@@ -11,17 +12,19 @@ const FULL_W: f32 = 350.0;
 const FULL_H: f32 = 520.0;
 
 // ── Timing ───────────────────────────────────────────────────────────────────
-const HOVER_TO_EXPAND_SECS: f32 = 0.2;  // dwell on Mini before auto-expanding
-const LEAVE_TO_HIDE_SECS: f32  = 0.05;  // idle after cursor leaves Full
-const EXPAND_SECS: f32         = 0.25;  // expand animation duration
-const COLLAPSE_SECS: f32       = 0.18;  // collapse animation duration
+const HOVER_TO_EXPAND_SECS: f32 = 0.2;
+const LEAVE_TO_HIDE_SECS: f32 = 0.05;
+const EXPAND_SECS: f32 = 0.25;
+const COLLAPSE_SECS: f32 = 0.18;
 
 // ── State machine ────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Phase {
-    /// Transparent 60×60 hotspot at corner — visually nothing.
+    /// First-launch configuration wizard.
+    Setup,
+    /// Transparent 60×60 hotspot — visually nothing.
     Hidden,
-    /// Visible 60×60 drop-target icon. Drag-and-drop works here.
+    /// Visible 60×60 drop-target icon.
     Mini,
     /// Growing from MINI to FULL (anim_t: 0 → 1).
     Expanding,
@@ -33,6 +36,7 @@ enum Phase {
 
 // ── App ──────────────────────────────────────────────────────────────────────
 pub struct SShareApp {
+    // ── Main app state ──────────────────────────────────────────────────────
     items: Vec<Item>,
     send_tx: mpsc::Sender<Message>,
     recv_rx: mpsc::Receiver<SharedItem>,
@@ -41,12 +45,21 @@ pub struct SShareApp {
     clipboard: Option<arboard::Clipboard>,
 
     phase: Phase,
-    anim_t: f32,       // 0.0 = MINI size, 1.0 = FULL size
-    hover_timer: f32,  // seconds cursor has rested on Mini
-    leave_timer: f32,  // seconds cursor has been outside Full
-    monitor_h: f32,    // cached monitor height (logical px)
-    initialized: bool, // false until first OuterPosition is sent
-    drop_grace: f32,   // seconds remaining in post-drop grace period
+    anim_t: f32,
+    hover_timer: f32,
+    leave_timer: f32,
+    monitor_h: f32,
+    initialized: bool,
+    drop_grace: f32,
+
+    // ── Setup wizard state ──────────────────────────────────────────────────
+    net_setup_tx: Option<mpsc::Sender<Config>>,
+    setup_mode: ConfigMode,
+    setup_port: String,
+    setup_address: String,
+    setup_login_startup: bool,
+    discovered_servers: Vec<String>,
+    discovery_rx: Option<mpsc::Receiver<String>>,
 }
 
 #[derive(Clone)]
@@ -61,8 +74,26 @@ impl SShareApp {
         send_tx: mpsc::Sender<Message>,
         recv_rx: mpsc::Receiver<SharedItem>,
         status_rx: mpsc::Receiver<String>,
+        net_setup_tx: Option<mpsc::Sender<Config>>,
     ) -> Self {
         load_japanese_font(&cc.egui_ctx);
+
+        let phase = if net_setup_tx.is_some() {
+            Phase::Setup
+        } else {
+            Phase::Hidden
+        };
+
+        let (discovery_rx, disc_tx) = {
+            let (tx, rx) = mpsc::channel();
+            (Some(rx), Some(tx))
+        };
+        if phase == Phase::Setup {
+            if let Some(tx) = disc_tx {
+                crate::discovery::start_browsing(tx);
+            }
+        }
+
         Self {
             items: Vec::new(),
             send_tx,
@@ -70,13 +101,24 @@ impl SShareApp {
             status_rx,
             status: "Starting…".into(),
             clipboard: arboard::Clipboard::new().ok(),
-            phase: Phase::Hidden,
+            phase,
             anim_t: 0.0,
             hover_timer: 0.0,
             leave_timer: 0.0,
             monitor_h: 900.0,
             initialized: false,
             drop_grace: 0.0,
+            net_setup_tx,
+            setup_mode: ConfigMode::Server,
+            setup_port: "7878".into(),
+            setup_address: String::new(),
+            setup_login_startup: false,
+            discovered_servers: Vec::new(),
+            discovery_rx: if phase == Phase::Setup {
+                discovery_rx
+            } else {
+                None
+            },
         }
     }
 
@@ -91,12 +133,18 @@ impl SShareApp {
         while let Ok(s) = self.status_rx.try_recv() {
             self.status = s;
         }
+        if let Some(rx) = &self.discovery_rx {
+            while let Ok(addr) = rx.try_recv() {
+                if !self.discovered_servers.contains(&addr) {
+                    self.discovered_servers.push(addr);
+                }
+            }
+        }
     }
 
     // ── Drop / paste handling ─────────────────────────────────────────────
     fn handle_input(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
-            // Ctrl+V / Cmd+V  (only useful in Full)
             for ev in &i.events {
                 if let egui::Event::Paste(text) = ev {
                     if !text.is_empty() {
@@ -105,7 +153,6 @@ impl SShareApp {
                     }
                 }
             }
-            // File drag-and-drop (works in Mini too)
             for f in &i.raw.dropped_files {
                 if let Some(path) = &f.path {
                     if let Ok(data) = std::fs::read(path) {
@@ -125,11 +172,193 @@ impl SShareApp {
         });
     }
 
+    // ── Setup UI ─────────────────────────────────────────────────────────
+    /// Returns true when the user clicks "確定" with valid settings.
+    fn show_setup_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut confirm = false;
+
+        ui.add_space(12.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("SShare セットアップ")
+                    .size(20.0)
+                    .strong(),
+            );
+        });
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        // ── Mode buttons ────────────────────────────────────────────────
+        ui.label(egui::RichText::new("起動モードを選択").size(13.0));
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let server_selected = self.setup_mode == ConfigMode::Server;
+            let client_selected = self.setup_mode == ConfigMode::Client;
+
+            let server_btn = egui::Button::new(
+                egui::RichText::new("  サーバー  ").size(14.0),
+            )
+            .fill(if server_selected {
+                egui::Color32::from_rgb(50, 130, 230)
+            } else {
+                egui::Color32::from_gray(55)
+            });
+            if ui.add(server_btn).clicked() {
+                self.setup_mode = ConfigMode::Server;
+            }
+
+            let client_btn = egui::Button::new(
+                egui::RichText::new("  クライアント  ").size(14.0),
+            )
+            .fill(if client_selected {
+                egui::Color32::from_rgb(50, 130, 230)
+            } else {
+                egui::Color32::from_gray(55)
+            });
+            if ui.add(client_btn).clicked() {
+                self.setup_mode = ConfigMode::Client;
+            }
+        });
+        ui.add_space(14.0);
+
+        match self.setup_mode {
+            ConfigMode::Server => {
+                // ── Server settings ──────────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.label("ポート番号:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.setup_port)
+                            .desired_width(80.0)
+                            .hint_text("7878"),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "クライアントからの接続を待ちます。\n\
+                         同じLANのクライアントへは自動検出されます。\n\
+                         SSH経由: ssh -L <port>:localhost:<port> user@host",
+                    )
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(140)),
+                );
+            }
+            ConfigMode::Client => {
+                // ── Connection target ────────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.label("接続先:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.setup_address)
+                            .desired_width(200.0)
+                            .hint_text("192.168.x.x:7878 または localhost:7878"),
+                    );
+                });
+                ui.add_space(8.0);
+
+                // ── Discovered servers ───────────────────────────────────
+                if !self.discovered_servers.is_empty() {
+                    ui.label(
+                        egui::RichText::new("検出されたサーバー:")
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(180)),
+                    );
+                    let servers = self.discovered_servers.clone();
+                    for addr in &servers {
+                        let btn = egui::Button::new(
+                            egui::RichText::new(format!("  {}  ", addr)).size(12.0),
+                        )
+                        .fill(egui::Color32::from_gray(45));
+                        if ui.add(btn).clicked() {
+                            self.setup_address = addr.clone();
+                        }
+                    }
+                    ui.add_space(4.0);
+                } else {
+                    ui.label(
+                        egui::RichText::new("サーバーを検索中…  (同じLANのみ自動検出)")
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(120)),
+                    );
+                    ui.add_space(4.0);
+                }
+
+                ui.label(
+                    egui::RichText::new(
+                        "SSH経由の場合: ssh -L 7878:localhost:7878 user@host\n\
+                         その後、接続先に localhost:7878 を入力",
+                    )
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(140)),
+                );
+            }
+        }
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // ── Login startup ────────────────────────────────────────────────
+        ui.checkbox(
+            &mut self.setup_login_startup,
+            "ログイン時に自動起動",
+        );
+        ui.add_space(12.0);
+
+        // ── Confirm button ───────────────────────────────────────────────
+        ui.vertical_centered(|ui| {
+            let ready = match self.setup_mode {
+                ConfigMode::Server => self.setup_port.parse::<u16>().is_ok(),
+                ConfigMode::Client => !self.setup_address.trim().is_empty(),
+            };
+            let btn = egui::Button::new(
+                egui::RichText::new("  確定  ").size(15.0).strong(),
+            )
+            .fill(if ready {
+                egui::Color32::from_rgb(50, 180, 90)
+            } else {
+                egui::Color32::from_gray(55)
+            });
+            if ui.add_enabled(ready, btn).clicked() {
+                confirm = true;
+            }
+        });
+
+        confirm
+    }
+
+    fn confirm_setup(&mut self, ctx: &egui::Context) {
+        let cfg = Config {
+            mode: self.setup_mode.clone(),
+            port: self.setup_port.parse().unwrap_or(7878),
+            server_address: self.setup_address.trim().to_string(),
+            login_startup: self.setup_login_startup,
+        };
+        cfg.save();
+        cfg.apply_login_startup();
+
+        if let Some(tx) = self.net_setup_tx.take() {
+            let _ = tx.send(cfg);
+        }
+        self.discovery_rx = None;
+
+        // Transition window from setup (decorated, centered) to app (floating, bottom-left).
+        self.phase = Phase::Hidden;
+        self.initialized = false;
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::viewport::WindowLevel::AlwaysOnTop,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            MINI_W, MINI_H,
+        )));
+    }
+
     // ── State machine + viewport commands ────────────────────────────────
     fn update_phase(&mut self, ctx: &egui::Context) {
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
         let cursor_in = ctx.input(|i| i.pointer.has_pointer());
-        let clicked = ctx.input(|i| i.pointer.primary_clicked());
 
         if let Some(sz) = ctx.input(|i| i.viewport().monitor_size) {
             self.monitor_h = sz.y;
@@ -137,9 +366,6 @@ impl SShareApp {
 
         let prev_phase = self.phase;
 
-        // After a drop, macOS takes a moment to transition from drag-session
-        // tracking back to normal pointer tracking.  Keep a grace timer so the
-        // window doesn't collapse in that gap.
         let file_just_dropped = ctx.input(|i| !i.raw.dropped_files.is_empty());
         if file_just_dropped {
             self.drop_grace = 0.6;
@@ -147,13 +373,9 @@ impl SShareApp {
             self.drop_grace = (self.drop_grace - dt).max(0.0);
         }
 
-        // During a drag, macOS replaces normal pointer tracking with a drag
-        // session so has_pointer() can be false even when the cursor is over
-        // the window. Treat hovered_files / drop grace as "cursor present".
         let file_dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let present = cursor_in || file_dragging || self.drop_grace > 0.0;
 
-        // ── Step 1: input-driven transitions ──────────────────────────────
         match self.phase {
             Phase::Hidden => {
                 if present {
@@ -164,8 +386,7 @@ impl SShareApp {
             Phase::Mini => {
                 if present {
                     self.hover_timer += dt;
-                    // File drag → expand immediately without dwell wait.
-                    if file_dragging || self.hover_timer >= HOVER_TO_EXPAND_SECS || clicked {
+                    if file_dragging || self.hover_timer >= HOVER_TO_EXPAND_SECS {
                         self.phase = Phase::Expanding;
                     }
                 } else {
@@ -183,11 +404,9 @@ impl SShareApp {
                     }
                 }
             }
-            // Expanding / Collapsing complete via animation below.
-            Phase::Expanding | Phase::Collapsing => {}
+            Phase::Expanding | Phase::Collapsing | Phase::Setup => {}
         }
 
-        // ── Step 2: advance anim_t, request repaint every animation frame ──
         match self.phase {
             Phase::Expanding => {
                 self.anim_t = (self.anim_t + dt / EXPAND_SECS).min(1.0);
@@ -209,32 +428,19 @@ impl SShareApp {
             }
         }
 
-        // ── Viewport commands ─────────────────────────────────────────────
-        // KEY INSIGHT (same as macOS Dock): never resize during animation.
-        // The window is always FULL_W×FULL_H when visible; only OuterPosition
-        // (Y) changes each frame.  Position changes are composited by the GPU
-        // and are smooth even at high frame rates.  InnerSize changes go
-        // through the window server and cause the observed jank.
         let animating = matches!(self.phase, Phase::Expanding | Phase::Collapsing);
-
-        // Resize only when crossing the Hidden boundary (once per show/hide).
         let size_changed = !self.initialized
             || (prev_phase == Phase::Hidden) != (self.phase == Phase::Hidden);
         if size_changed {
             let (w, h) = self.window_size();
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
         }
-
-        // Position every frame while animating; once on state transitions.
         if !self.initialized || self.phase != prev_phase || animating {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                self.window_pos(),
-            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.window_pos()));
             self.initialized = true;
         }
     }
 
-    /// Window size: small transparent hotspot when Hidden, full otherwise.
     fn window_size(&self) -> (f32, f32) {
         if self.phase == Phase::Hidden {
             (MINI_W, MINI_H)
@@ -243,26 +449,16 @@ impl SShareApp {
         }
     }
 
-    /// Window Y-only animation — no width change ever during animation.
     fn window_pos(&self) -> egui::Pos2 {
-        // Collapsed Y: window top sits at (monitor_h − MINI_H) so only the
-        // top MINI_H pixels are on-screen (the "mini strip").
-        // Expanded Y: window top at (monitor_h − FULL_H), fully on-screen.
         let y_collapsed = self.monitor_h - MINI_H;
-        let y_expanded  = self.monitor_h - FULL_H;
-
+        let y_expanded = self.monitor_h - FULL_H;
         let y = match self.phase {
-            Phase::Hidden => self.monitor_h - MINI_H,
-            Phase::Mini   => y_collapsed,
-            Phase::Expanding => {
-                let t = ease_out_cubic(self.anim_t);
-                lerp(y_collapsed, y_expanded, t)
-            }
+            Phase::Hidden => y_collapsed,
+            Phase::Mini => y_collapsed,
+            Phase::Expanding => lerp(y_collapsed, y_expanded, ease_out_cubic(self.anim_t)),
             Phase::Full => y_expanded,
-            Phase::Collapsing => {
-                let t = ease_in_cubic(self.anim_t); // 1 → 0
-                lerp(y_collapsed, y_expanded, t)
-            }
+            Phase::Collapsing => lerp(y_collapsed, y_expanded, ease_in_cubic(self.anim_t)),
+            Phase::Setup => y_collapsed,
         };
         egui::pos2(0.0, y)
     }
@@ -271,30 +467,60 @@ impl SShareApp {
 // ── eframe::App ───────────────────────────────────────────────────────────────
 impl eframe::App for SShareApp {
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
-        // Hidden: fully transparent window (invisible hotspot).
-        if self.phase == Phase::Hidden {
-            [0.0; 4]
-        } else {
-            let c = egui::Color32::from_rgb(28, 28, 34);
-            [
-                c.r() as f32 / 255.0,
-                c.g() as f32 / 255.0,
-                c.b() as f32 / 255.0,
-                1.0,
-            ]
+        match self.phase {
+            Phase::Setup => {
+                let c = egui::Color32::from_rgb(30, 30, 38);
+                [
+                    c.r() as f32 / 255.0,
+                    c.g() as f32 / 255.0,
+                    c.b() as f32 / 255.0,
+                    1.0,
+                ]
+            }
+            Phase::Hidden => [0.0; 4],
+            _ => {
+                let c = egui::Color32::from_rgb(28, 28, 34);
+                [
+                    c.r() as f32 / 255.0,
+                    c.g() as f32 / 255.0,
+                    c.b() as f32 / 255.0,
+                    1.0,
+                ]
+            }
         }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+
+        // ── Setup wizard ─────────────────────────────────────────────────────
+        if self.phase == Phase::Setup {
+            if let Some(sz) = ctx.input(|i| i.viewport().monitor_size) {
+                self.monitor_h = sz.y;
+            }
+            let mut confirmed = false;
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(30, 30, 38))
+                        .inner_margin(egui::Margin::symmetric(24.0, 12.0)),
+                )
+                .show(ctx, |ui| {
+                    confirmed = self.show_setup_ui(ui);
+                });
+            if confirmed {
+                self.confirm_setup(ctx);
+            }
+            return;
+        }
+
+        // ── Main app ─────────────────────────────────────────────────────────
         self.handle_input(ctx);
         self.update_phase(ctx);
 
         match self.phase {
-            // ── Hidden: near-transparent hotspot ──────────────────────────
-            // On macOS a fully transparent window may not receive pointer
-            // events, so fill with 1/255 alpha — visually invisible but
-            // keeps the window hittable.
+            Phase::Setup => unreachable!(),
+
             Phase::Hidden => {
                 egui::CentralPanel::default()
                     .frame(
@@ -304,13 +530,10 @@ impl eframe::App for SShareApp {
                     .show(ctx, |_| {});
             }
 
-            // ── Mini / Expanding / Full / Collapsing ───────────────────────
-            // All share one 350×520 window.  In Mini the window is positioned
-            // so only the top MINI_H px are on-screen — exactly like the Dock.
-            // Animation slides the Y position; no resize occurs mid-animation.
             Phase::Mini | Phase::Expanding | Phase::Full | Phase::Collapsing => {
                 let hovering_file = ctx.input(|i| !i.raw.hovered_files.is_empty());
-                let hover_progress = (self.hover_timer / HOVER_TO_EXPAND_SECS).clamp(0.0, 1.0);
+                let hover_progress =
+                    (self.hover_timer / HOVER_TO_EXPAND_SECS).clamp(0.0, 1.0);
                 let dot_color = if self.status.starts_with("Connected") {
                     egui::Color32::from_rgb(50, 210, 100)
                 } else {
@@ -319,12 +542,15 @@ impl eframe::App for SShareApp {
 
                 let frame = egui::Frame::none()
                     .fill(egui::Color32::from_rgb(28, 28, 34))
-                    .rounding(egui::Rounding { nw: 0.0, sw: 0.0, ne: 10.0, se: 0.0 })
+                    .rounding(egui::Rounding {
+                        nw: 0.0,
+                        sw: 0.0,
+                        ne: 10.0,
+                        se: 0.0,
+                    })
                     .inner_margin(egui::Margin::symmetric(8.0, 6.0));
 
                 egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-                    // ── Top strip (always visible in Mini) ─────────────────
-                    // Height = MINI_H.  Shows icon + progress ring + status dot.
                     let strip_rect = egui::Rect::from_min_size(
                         ui.min_rect().min,
                         egui::vec2(ui.available_width(), MINI_H - 12.0),
@@ -332,14 +558,14 @@ impl eframe::App for SShareApp {
                     let center = strip_rect.center();
                     let radius = 20.0;
 
-                    // Background ring
                     ui.painter().circle_stroke(
-                        center, radius,
+                        center,
+                        radius,
                         egui::Stroke::new(2.0, egui::Color32::from_gray(55)),
                     );
-                    // Progress arc (fill as hover_timer advances toward expand)
                     let arc_alpha = (200.0 * hover_progress) as u8;
-                    let arc_color = egui::Color32::from_rgba_premultiplied(80, 160, 255, arc_alpha);
+                    let arc_color =
+                        egui::Color32::from_rgba_premultiplied(80, 160, 255, arc_alpha);
                     let segs = 32usize;
                     for seg in 0..(segs as f32 * hover_progress) as usize {
                         let a0 = std::f32::consts::TAU * seg as f32 / segs as f32
@@ -347,12 +573,13 @@ impl eframe::App for SShareApp {
                         let a1 = std::f32::consts::TAU * (seg + 1) as f32 / segs as f32
                             - std::f32::consts::FRAC_PI_2;
                         ui.painter().line_segment(
-                            [center + egui::vec2(a0.cos(), a0.sin()) * radius,
-                             center + egui::vec2(a1.cos(), a1.sin()) * radius],
+                            [
+                                center + egui::vec2(a0.cos(), a0.sin()) * radius,
+                                center + egui::vec2(a1.cos(), a1.sin()) * radius,
+                            ],
                             egui::Stroke::new(2.5, arc_color),
                         );
                     }
-                    // Icon
                     ui.painter().text(
                         center - egui::vec2(0.0, 3.0),
                         egui::Align2::CENTER_CENTER,
@@ -360,18 +587,15 @@ impl eframe::App for SShareApp {
                         egui::FontId::proportional(20.0),
                         egui::Color32::from_gray(210),
                     );
-                    // Status dot
                     ui.painter().circle_filled(
-                        center + egui::vec2(12.0, 10.0), 4.0, dot_color,
+                        center + egui::vec2(12.0, 10.0),
+                        4.0,
+                        dot_color,
                     );
-
-                    // Allocate space so egui knows we used the strip.
                     ui.allocate_rect(strip_rect, egui::Sense::hover());
 
-                    // ── Below-strip content (only visible once window rises) ─
                     ui.separator();
 
-                    // Header bar
                     ui.horizontal(|ui| {
                         ui.colored_label(dot_color, "●");
                         ui.label(
@@ -379,24 +603,40 @@ impl eframe::App for SShareApp {
                                 .size(11.0)
                                 .color(egui::Color32::from_gray(180)),
                         );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(egui::Button::new(
-                                egui::RichText::new("✕").size(11.0)
-                                    .color(egui::Color32::from_gray(150)),
-                            ).frame(false)).clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-                            if ui.add(egui::Button::new(
-                                egui::RichText::new("Clear").size(11.0)
-                                    .color(egui::Color32::from_gray(150)),
-                            ).frame(false)).clicked() {
-                                self.items.clear();
-                            }
-                        });
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("✕")
+                                                .size(11.0)
+                                                .color(egui::Color32::from_gray(150)),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                                {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("Clear")
+                                                .size(11.0)
+                                                .color(egui::Color32::from_gray(150)),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                                {
+                                    self.items.clear();
+                                }
+                            },
+                        );
                     });
                     ui.separator();
 
-                    // Items list
                     let list_h = ui.available_height() - 62.0;
                     egui::ScrollArea::vertical()
                         .max_height(list_h)
@@ -407,13 +647,19 @@ impl eframe::App for SShareApp {
                                 ui.horizontal(|ui| match item {
                                     Item::Text(t) => {
                                         ui.label(
-                                            egui::RichText::new(format!("📝 {}", truncate(t, 46)))
-                                                .size(12.0).color(egui::Color32::from_gray(220)),
+                                            egui::RichText::new(format!(
+                                                "📝 {}",
+                                                truncate(t, 46)
+                                            ))
+                                            .size(12.0)
+                                            .color(egui::Color32::from_gray(220)),
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if ui.small_button("✕").clicked() { remove = Some(i); }
+                                                if ui.small_button("✕").clicked() {
+                                                    remove = Some(i);
+                                                }
                                                 if ui.small_button("Copy").clicked() {
                                                     if let Some(cb) = &mut self.clipboard {
                                                         let _ = cb.set_text(t.clone());
@@ -424,15 +670,24 @@ impl eframe::App for SShareApp {
                                     }
                                     Item::File { name, data } => {
                                         ui.label(
-                                            egui::RichText::new(format!("📎 {} ({})", name, fmt_size(data.len())))
-                                                .size(12.0).color(egui::Color32::from_gray(220)),
+                                            egui::RichText::new(format!(
+                                                "📎 {} ({})",
+                                                name,
+                                                fmt_size(data.len())
+                                            ))
+                                            .size(12.0)
+                                            .color(egui::Color32::from_gray(220)),
                                         );
                                         let (name, data) = (name.clone(), data.clone());
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if ui.small_button("✕").clicked() { remove = Some(i); }
-                                                if ui.small_button("Save").clicked() { save_file(&name, &data); }
+                                                if ui.small_button("✕").clicked() {
+                                                    remove = Some(i);
+                                                }
+                                                if ui.small_button("Save").clicked() {
+                                                    save_file(&name, &data);
+                                                }
                                             },
                                         );
                                     }
@@ -442,14 +697,18 @@ impl eframe::App for SShareApp {
                             if self.items.is_empty() {
                                 ui.vertical_centered(|ui| {
                                     ui.add_space(16.0);
-                                    ui.label(egui::RichText::new("No shared items yet.")
-                                        .size(12.0).color(egui::Color32::from_gray(100)));
+                                    ui.label(
+                                        egui::RichText::new("No shared items yet.")
+                                            .size(12.0)
+                                            .color(egui::Color32::from_gray(100)),
+                                    );
                                 });
                             }
-                            if let Some(i) = remove { self.items.remove(i); }
+                            if let Some(i) = remove {
+                                self.items.remove(i);
+                            }
                         });
 
-                    // Drop zone
                     ui.separator();
                     let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
                     let (rect, _) = ui.allocate_exact_size(
@@ -466,10 +725,16 @@ impl eframe::App for SShareApp {
                     } else {
                         egui::Color32::from_gray(75)
                     };
-                    ui.painter().rect(rect, 6.0, bg, egui::Stroke::new(1.5, border));
+                    ui.painter()
+                        .rect(rect, 6.0, bg, egui::Stroke::new(1.5, border));
                     ui.painter().text(
-                        rect.center(), egui::Align2::CENTER_CENTER,
-                        if hovering { "Drop to share →" } else { "Drop files  •  Ctrl+V to paste" },
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if hovering {
+                            "Drop to share →"
+                        } else {
+                            "Drop files  •  Ctrl+V to paste"
+                        },
                         egui::FontId::proportional(12.0),
                         egui::Color32::from_gray(130),
                     );
@@ -554,7 +819,11 @@ fn load_japanese_font(ctx: &egui::Context) {
             .font_data
             .insert("jp".to_owned(), egui::FontData::from_owned(data));
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push("jp".to_owned());
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("jp".to_owned());
         }
         ctx.set_fonts(fonts);
     }

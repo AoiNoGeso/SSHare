@@ -3,6 +3,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc as tmpc;
 use tokio::time::{sleep, Duration};
 
+use crate::discovery;
 use crate::protocol::{read_msg, write_msg, Message};
 
 pub enum Mode {
@@ -43,6 +44,7 @@ pub async fn run(
                 Err(e) => s(format!("Failed to bind port {port}: {e}")),
                 Ok(listener) => {
                     s(format!("Listening on port {port}"));
+                    discovery::start_advertising(port);
                     loop {
                         match listener.accept().await {
                             Ok((stream, peer)) => {
