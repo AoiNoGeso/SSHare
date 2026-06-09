@@ -51,6 +51,7 @@ pub struct SShareApp {
     monitor_h: f32,
     initialized: bool,
     drop_grace: f32,
+    debug_frame: u32,
 
     // ── Setup wizard state ──────────────────────────────────────────────────
     net_setup_tx: Option<mpsc::Sender<Config>>,
@@ -108,6 +109,7 @@ impl SShareApp {
             monitor_h: 900.0,
             initialized: false,
             drop_grace: 0.0,
+            debug_frame: 0,
             net_setup_tx,
             setup_mode: ConfigMode::Server,
             setup_port: "7878".into(),
@@ -421,16 +423,17 @@ impl SShareApp {
         }
         let monitor_changed = (self.monitor_h - prev_monitor_h).abs() > 0.5;
 
-        // Debug: print key values once when monitor_h stabilises
-        if monitor_changed || !self.initialized {
+        // Debug: track actual window position over first 10 frames
+        self.debug_frame += 1;
+        if self.debug_frame <= 10 {
             let outer = ctx.input(|i| i.viewport().outer_rect);
-            let inner = ctx.input(|i| i.viewport().inner_rect);
             let scale = ctx.pixels_per_point();
             eprintln!(
-                "[SShare] monitor_h={:.0}  scale={:.2}  outer={:?}  inner={:?}  \
-                 will_place_at=({:.0},{:.0})",
-                self.monitor_h, scale, outer, inner,
-                0.0_f32, self.monitor_h - MINI_H
+                "[SShare f{:02}] monitor_h={:.0}  scale={:.2}  \
+                 actual_outer={:?}  target_y={:.0}",
+                self.debug_frame, self.monitor_h, scale,
+                outer.map(|r| r.min),
+                self.monitor_h - MINI_H
             );
         }
 
