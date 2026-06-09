@@ -338,11 +338,19 @@ impl SShareApp {
         cfg.apply_login_startup();
 
         if let Some(tx) = self.net_setup_tx.take() {
+            // First launch: unblock the waiting network thread.
             let _ = tx.send(cfg);
+        } else {
+            // Re-setup: drop old channels and start a fresh network thread.
+            self.restart_network(&Config {
+                mode: self.setup_mode.clone(),
+                port: self.setup_port.parse().unwrap_or(7878),
+                server_address: self.setup_address.trim().to_string(),
+                login_startup: self.setup_login_startup,
+            });
         }
         self.discovery_rx = None;
 
-        // Transition window from setup (decorated, centered) to app (floating, bottom-left).
         self.phase = Phase::Hidden;
         self.initialized = false;
 
@@ -353,6 +361,53 @@ impl SShareApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             MINI_W, MINI_H,
         )));
+    }
+
+    fn begin_setup(&mut self, ctx: &egui::Context) {
+        // Pre-fill fields from saved config so user sees current values.
+        if let Some(cfg) = Config::load() {
+            self.setup_mode = cfg.mode;
+            self.setup_port = cfg.port.to_string();
+            self.setup_address = cfg.server_address;
+            self.setup_login_startup = cfg.login_startup;
+        }
+
+        let (disc_tx, disc_rx) = mpsc::channel();
+        crate::discovery::start_browsing(disc_tx);
+        self.discovery_rx = Some(disc_rx);
+        self.discovered_servers.clear();
+
+        self.phase = Phase::Setup;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::viewport::WindowLevel::Normal,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(480.0, 440.0)));
+    }
+
+    fn restart_network(&mut self, cfg: &Config) {
+        let (to_gui_tx, to_gui_rx) = mpsc::channel::<crate::network::SharedItem>();
+        let (from_gui_tx, from_gui_rx) = mpsc::channel::<crate::protocol::Message>();
+        let (status_tx, status_rx) = mpsc::channel::<String>();
+
+        let mode = match cfg.mode {
+            ConfigMode::Server => crate::network::Mode::Server(cfg.port),
+            ConfigMode::Client => crate::network::Mode::Client(cfg.server_address.clone()),
+        };
+
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(crate::network::run(mode, to_gui_tx, from_gui_rx, status_tx));
+        });
+
+        // Replacing send_tx drops the old Sender → old from_gui channel closes → old thread exits.
+        self.send_tx = from_gui_tx;
+        self.recv_rx = to_gui_rx;
+        self.status_rx = status_rx;
+        self.status = "Reconnecting…".into();
     }
 
     // ── State machine + viewport commands ────────────────────────────────
@@ -434,6 +489,11 @@ impl SShareApp {
         if size_changed {
             let (w, h) = self.window_size();
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+            // On macOS/Linux, a fully transparent window is click-through by default.
+            // Explicitly opt in to receiving pointer events so the hidden hotspot works.
+            if self.phase == Phase::Hidden {
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+            }
         }
         if !self.initialized || self.phase != prev_phase || animating {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.window_pos()));
@@ -517,16 +577,14 @@ impl eframe::App for SShareApp {
         // ── Main app ─────────────────────────────────────────────────────────
         self.handle_input(ctx);
         self.update_phase(ctx);
+        let mut open_settings = false;
 
         match self.phase {
             Phase::Setup => unreachable!(),
 
             Phase::Hidden => {
                 egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 1)),
-                    )
+                    .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
                     .show(ctx, |_| {});
             }
 
@@ -596,43 +654,28 @@ impl eframe::App for SShareApp {
 
                     ui.separator();
 
+                    // ── Button row (above status) ──────────────────────────
+                    ui.horizontal(|ui| {
+                        if icon_btn(ui, "×", "終了") {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if text_btn(ui, "Clear") {
+                                self.items.clear();
+                            }
+                            if icon_btn(ui, "⚙", "設定") {
+                                open_settings = true;
+                            }
+                        });
+                    });
+
+                    // ── Status row ─────────────────────────────────────────
                     ui.horizontal(|ui| {
                         ui.colored_label(dot_color, "●");
                         ui.label(
                             egui::RichText::new(&self.status)
                                 .size(11.0)
                                 .color(egui::Color32::from_gray(180)),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new("✕")
-                                                .size(11.0)
-                                                .color(egui::Color32::from_gray(150)),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                }
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new("Clear")
-                                                .size(11.0)
-                                                .color(egui::Color32::from_gray(150)),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    self.items.clear();
-                                }
-                            },
                         );
                     });
                     ui.separator();
@@ -741,10 +784,65 @@ impl eframe::App for SShareApp {
                 });
             }
         }
+
+        if open_settings {
+            self.begin_setup(ctx);
+        }
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Icon button (single glyph). Returns true if clicked.
+/// Shows a rounded highlight background and white text on hover.
+fn icon_btn(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, 5.0, egui::Color32::from_gray(58));
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        egui::FontId::proportional(13.0),
+        if hovered {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_gray(155)
+        },
+    );
+    resp.on_hover_text(tooltip).clicked()
+}
+
+/// Text button. Returns true if clicked.
+fn text_btn(ui: &mut egui::Ui, label: &str) -> bool {
+    let desired = egui::vec2(
+        ui.fonts(|f| f.glyph_width(&egui::FontId::proportional(11.0), 'x')) * label.len() as f32
+            + 10.0,
+        22.0,
+    );
+    let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, 5.0, egui::Color32::from_gray(58));
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(11.0),
+        if hovered {
+            egui::Color32::from_gray(220)
+        } else {
+            egui::Color32::from_gray(140)
+        },
+    );
+    resp.clicked()
+}
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
