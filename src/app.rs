@@ -656,7 +656,7 @@ impl eframe::App for SShareApp {
 
                     // ── Button row (above status) ──────────────────────────
                     ui.horizontal(|ui| {
-                        if icon_btn(ui, "×", "終了") {
+                        if close_btn(ui) {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -792,6 +792,29 @@ impl eframe::App for SShareApp {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Close button: compact rect so the highlight wraps the × character correctly.
+fn close_btn(ui: &mut egui::Ui) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(16.0, 20.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, 5.0, egui::Color32::from_gray(58));
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "×",
+        egui::FontId::proportional(14.0),
+        if hovered {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_gray(155)
+        },
+    );
+    resp.on_hover_text("終了").clicked()
+}
 
 /// Icon button (single glyph). Returns true if clicked.
 /// Shows a rounded highlight background and white text on hover.
