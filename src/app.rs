@@ -51,7 +51,6 @@ pub struct SShareApp {
     monitor_h: f32,
     initialized: bool,
     drop_grace: f32,
-    debug_frame: u32,
 
     // ── Setup wizard state ──────────────────────────────────────────────────
     net_setup_tx: Option<mpsc::Sender<Config>>,
@@ -109,7 +108,6 @@ impl SShareApp {
             monitor_h: 900.0,
             initialized: false,
             drop_grace: 0.0,
-            debug_frame: 0,
             net_setup_tx,
             setup_mode: ConfigMode::Server,
             setup_port: "7878".into(),
@@ -423,21 +421,6 @@ impl SShareApp {
         }
         let monitor_changed = (self.monitor_h - prev_monitor_h).abs() > 0.5;
 
-        // Debug: track actual position over first 60 frames and on phase change
-        let prev_debug_phase = self.phase;
-        self.debug_frame += 1;
-        let outer_y = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min.y));
-        if self.debug_frame <= 60 || monitor_changed {
-            eprintln!(
-                "[SShare f{:03} {:?}] monitor_h={:.0}  outer_y={:?}  target_y={:.0}",
-                self.debug_frame,
-                prev_debug_phase,
-                self.monitor_h,
-                outer_y,
-                self.monitor_h - MINI_H,
-            );
-        }
-
         let prev_phase = self.phase;
 
         let file_just_dropped = ctx.input(|i| !i.raw.dropped_files.is_empty());
@@ -503,43 +486,40 @@ impl SShareApp {
         }
 
         let animating = matches!(self.phase, Phase::Expanding | Phase::Collapsing);
-        let size_changed = !self.initialized
-            || (prev_phase == Phase::Hidden) != (self.phase == Phase::Hidden);
-        if size_changed {
+        let needs_update = !self.initialized || self.phase != prev_phase || animating || monitor_changed;
+        if needs_update {
             let (w, h) = self.window_size();
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
-            // On macOS/Linux, a fully transparent window is click-through by default.
-            // Explicitly opt in to receiving pointer events so the hidden hotspot works.
-            if self.phase == Phase::Hidden {
-                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
-            }
-        }
-        if !self.initialized || self.phase != prev_phase || animating || monitor_changed {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.window_pos()));
             self.initialized = true;
+        }
+        // Transparent windows are click-through by default; opt back in for the hidden hotspot.
+        if prev_phase != Phase::Hidden && self.phase == Phase::Hidden {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+        }
+        if !self.initialized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
         }
     }
 
     fn window_size(&self) -> (f32, f32) {
-        if self.phase == Phase::Hidden {
-            (MINI_W, MINI_H)
-        } else {
-            (FULL_W, FULL_H)
-        }
+        // Height grows/shrinks with animation; window bottom stays pinned to monitor_h.
+        // This keeps the window fully on-screen so the WM never overrides the position.
+        let h = match self.phase {
+            Phase::Hidden | Phase::Mini => MINI_H,
+            Phase::Expanding => lerp(MINI_H, FULL_H, ease_out_cubic(self.anim_t)),
+            Phase::Full => FULL_H,
+            Phase::Collapsing => lerp(MINI_H, FULL_H, ease_in_cubic(self.anim_t)),
+            Phase::Setup => MINI_H,
+        };
+        let w = if self.phase == Phase::Hidden { MINI_W } else { FULL_W };
+        (w, h)
     }
 
     fn window_pos(&self) -> egui::Pos2 {
-        let y_collapsed = self.monitor_h - MINI_H;
-        let y_expanded = self.monitor_h - FULL_H;
-        let y = match self.phase {
-            Phase::Hidden => y_collapsed,
-            Phase::Mini => y_collapsed,
-            Phase::Expanding => lerp(y_collapsed, y_expanded, ease_out_cubic(self.anim_t)),
-            Phase::Full => y_expanded,
-            Phase::Collapsing => lerp(y_collapsed, y_expanded, ease_in_cubic(self.anim_t)),
-            Phase::Setup => y_collapsed,
-        };
-        egui::pos2(0.0, y)
+        // Always pin the bottom edge of the window to the bottom of the monitor.
+        let (_, h) = self.window_size();
+        egui::pos2(0.0, self.monitor_h - h)
     }
 }
 
