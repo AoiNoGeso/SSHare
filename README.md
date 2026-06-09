@@ -71,25 +71,34 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 ```
 
-#### 3. ビルド
+#### 3. ビルドとインストール
 
 ```bash
 git clone https://github.com/AoiNoGeso/SSHare.git
 cd SSHare
-cargo build --release
+./install_linux.sh
 ```
+
+インストールスクリプトが以下を自動で行います:
+- `~/.local/bin/sshare` にバイナリをインストール
+- `~/.local/share/icons/` に SVG アイコンを配置
+- `~/.local/share/applications/sshare.desktop` を作成 → アプリランチャーに登録
+
+インストール後はアプリランチャー（GNOME の「アクティビティ」など）で **SShare** と検索して起動できます。
 
 #### 4. 初回起動とセットアップ
 
+アプリランチャーまたはターミナルから起動します:
+
 ```bash
-./target/release/sshare
+sshare
 ```
 
 初回起動時にセットアップ画面が開きます。
 
 - **モード選択**: 「サーバー」を選択
 - **ポート番号**: デフォルト `7878`（変更する場合は Mac 側と合わせる）
-- **ログイン時に自動起動**: チェックを入れると `~/.config/autostart/sshare.desktop` が作成されます
+- **ログイン時に自動起動**: チェックを入れると `~/.config/autostart/sshare.desktop` が更新されます
 - 「確定」をクリック → 左下に常駐ウィンドウが表示されます
 
 > **Wayland 環境の場合**: `arboard` は X11 が必要です。  

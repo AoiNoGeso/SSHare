@@ -15,6 +15,23 @@ mkdir -p "$MACOS" "$RESOURCES"
 cp target/release/sshare "$MACOS/SShare"
 chmod +x "$MACOS/SShare"
 
+# Icon: convert SVG → icns if rsvg-convert + iconutil are available
+if command -v rsvg-convert &>/dev/null; then
+  ICONSET="$RESOURCES/SShare.iconset"
+  mkdir -p "$ICONSET"
+  for size in 16 32 64 128 256 512; do
+    rsvg-convert -w $size -h $size assets/icon.svg -o "$ICONSET/icon_${size}x${size}.png"
+    rsvg-convert -w $((size*2)) -h $((size*2)) assets/icon.svg -o "$ICONSET/icon_${size}x${size}@2x.png"
+  done
+  iconutil -c icns -o "$RESOURCES/SShare.icns" "$ICONSET"
+  rm -rf "$ICONSET"
+  ICON_KEY='    <key>CFBundleIconFile</key>\n    <string>SShare</string>'
+  sed -i '' "s|<key>NSSupportsAutomaticGraphicsSwitching</key>|${ICON_KEY}\n    <key>NSSupportsAutomaticGraphicsSwitching</key>|" "$CONTENTS/Info.plist"
+  echo "アイコン生成完了 (rsvg-convert 使用)"
+else
+  echo "ヒント: brew install librsvg でアイコンを自動生成できます"
+fi
+
 cat > "$CONTENTS/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

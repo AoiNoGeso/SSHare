@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Background -->
+  <rect width="64" height="64" rx="14" fill="#1c1c22"/>
+  <!-- Upload arrow shaft -->
+  <rect x="29" y="28" width="6" height="20" rx="3" fill="#50a0ff"/>
+  <!-- Arrow head -->
+  <polygon points="32,10 19,28 45,28" fill="#50a0ff"/>
+  <!-- Connection dots -->
+  <circle cx="12" cy="52" r="4" fill="#32d264"/>
+  <circle cx="32" cy="52" r="4" fill="#32d264"/>
+  <circle cx="52" cy="52" r="4" fill="#32d264"/>
+  <!-- Connecting line -->
+  <line x1="12" y1="52" x2="52" y2="52" stroke="#32d264" stroke-width="2" stroke-dasharray="4,4"/>
+</svg>
