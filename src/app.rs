@@ -421,6 +421,19 @@ impl SShareApp {
         }
         let monitor_changed = (self.monitor_h - prev_monitor_h).abs() > 0.5;
 
+        // Debug: print key values once when monitor_h stabilises
+        if monitor_changed || !self.initialized {
+            let outer = ctx.input(|i| i.viewport().outer_rect);
+            let inner = ctx.input(|i| i.viewport().inner_rect);
+            let scale = ctx.pixels_per_point();
+            eprintln!(
+                "[SShare] monitor_h={:.0}  scale={:.2}  outer={:?}  inner={:?}  \
+                 will_place_at=({:.0},{:.0})",
+                self.monitor_h, scale, outer, inner,
+                0.0_f32, self.monitor_h - MINI_H
+            );
+        }
+
         let prev_phase = self.phase;
 
         let file_just_dropped = ctx.input(|i| !i.raw.dropped_files.is_empty());
