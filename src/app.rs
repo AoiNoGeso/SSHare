@@ -21,11 +21,12 @@ enum Item {
 
 impl SShareApp {
     pub fn new(
-        _cc: &eframe::CreationContext,
+        cc: &eframe::CreationContext,
         send_tx: mpsc::Sender<Message>,
         recv_rx: mpsc::Receiver<SharedItem>,
         status_rx: mpsc::Receiver<String>,
     ) -> Self {
+        load_japanese_font(&cc.egui_ctx);
         Self {
             items: Vec::new(),
             send_tx,
@@ -252,6 +253,38 @@ fn fmt_size(n: usize) -> String {
         format!("{:.1} MB", n as f64 / MB as f64)
     } else {
         format!("{:.2} GB", n as f64 / GB as f64)
+    }
+}
+
+fn load_japanese_font(ctx: &egui::Context) {
+    // Candidate paths ordered by preference (macOS first, then Linux).
+    let candidates: &[&str] = &[
+        // macOS
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/Library/Fonts/Arial Unicode MS.ttf",
+        // Linux – Noto CJK (various distro paths)
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
+        // Linux – IPAex / IPA Gothic
+        "/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    ];
+
+    let font_data = candidates.iter().find_map(|path| std::fs::read(path).ok());
+
+    if let Some(data) = font_data {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts
+            .font_data
+            .insert("jp".to_owned(), egui::FontData::from_owned(data));
+        // Append as fallback so ASCII still uses the default font.
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push("jp".to_owned());
+        }
+        ctx.set_fonts(fonts);
     }
 }
 
