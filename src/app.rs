@@ -51,6 +51,7 @@ pub struct SShareApp {
     monitor_h: f32,
     initialized: bool,
     drop_grace: f32,
+    dbg_frame: u32,
 
     // ── Setup wizard state ──────────────────────────────────────────────────
     net_setup_tx: Option<mpsc::Sender<Config>>,
@@ -108,6 +109,7 @@ impl SShareApp {
             monitor_h: 900.0,
             initialized: false,
             drop_grace: 0.0,
+            dbg_frame: 0,
             net_setup_tx,
             setup_mode: ConfigMode::Server,
             setup_port: "7878".into(),
@@ -492,6 +494,14 @@ impl SShareApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.window_pos()));
             self.initialized = true;
+        }
+        // Debug: print outer_y every 60 frames to confirm actual window position
+        self.dbg_frame += 1;
+        if self.dbg_frame % 60 == 1 {
+            let outer_y = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min.y));
+            let (_, h) = self.window_size();
+            eprintln!("[SShare {:?}] outer_y={:?}  sent_y={:.0}  monitor_h={:.0}",
+                self.phase, outer_y, self.monitor_h - h, self.monitor_h);
         }
         // Transparent windows are click-through by default; opt back in for the hidden hotspot.
         if prev_phase != Phase::Hidden && self.phase == Phase::Hidden {
