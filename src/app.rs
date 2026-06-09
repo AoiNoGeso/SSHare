@@ -4,17 +4,34 @@ use std::sync::mpsc;
 use crate::network::SharedItem;
 use crate::protocol::Message;
 
-// ── Layout constants (pub so main.rs can use them for initial window size) ──
-pub const TAB_W: f32 = 28.0;
-pub const TAB_H: f32 = 80.0;
-const FULL_W: f32 = 340.0;
+// ── Window geometry ──────────────────────────────────────────────────────────
+pub const MINI_W: f32 = 60.0;
+pub const MINI_H: f32 = 60.0;
+const FULL_W: f32 = 350.0;
 const FULL_H: f32 = 520.0;
 
-/// How many seconds after the cursor leaves before collapsing.
-const LEAVE_DELAY: f32 = 0.8;
-/// Animation speed (fraction of the range per second).
-const ANIM_SPEED: f32 = 8.0;
+// ── Timing ───────────────────────────────────────────────────────────────────
+const HOVER_TO_EXPAND_SECS: f32 = 0.2;  // dwell on Mini before auto-expanding
+const LEAVE_TO_HIDE_SECS: f32  = 0.05;  // idle after cursor leaves Full
+const EXPAND_SECS: f32         = 0.25;  // expand animation duration
+const COLLAPSE_SECS: f32       = 0.18;  // collapse animation duration
 
+// ── State machine ────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Phase {
+    /// Transparent 60×60 hotspot at corner — visually nothing.
+    Hidden,
+    /// Visible 60×60 drop-target icon. Drag-and-drop works here.
+    Mini,
+    /// Growing from MINI to FULL (anim_t: 0 → 1).
+    Expanding,
+    /// Full 350×520 panel.
+    Full,
+    /// Shrinking back to corner (anim_t: 1 → 0), then Hidden.
+    Collapsing,
+}
+
+// ── App ──────────────────────────────────────────────────────────────────────
 pub struct SShareApp {
     items: Vec<Item>,
     send_tx: mpsc::Sender<Message>,
@@ -22,10 +39,14 @@ pub struct SShareApp {
     status_rx: mpsc::Receiver<String>,
     status: String,
     clipboard: Option<arboard::Clipboard>,
-    /// 0.0 = fully collapsed (tab only), 1.0 = fully expanded.
-    anim_t: f32,
-    /// Seconds since the cursor last left the window.
-    leave_timer: f32,
+
+    phase: Phase,
+    anim_t: f32,       // 0.0 = MINI size, 1.0 = FULL size
+    hover_timer: f32,  // seconds cursor has rested on Mini
+    leave_timer: f32,  // seconds cursor has been outside Full
+    monitor_h: f32,    // cached monitor height (logical px)
+    initialized: bool, // false until first OuterPosition is sent
+    drop_grace: f32,   // seconds remaining in post-drop grace period
 }
 
 #[derive(Clone)]
@@ -49,11 +70,17 @@ impl SShareApp {
             status_rx,
             status: "Starting…".into(),
             clipboard: arboard::Clipboard::new().ok(),
+            phase: Phase::Hidden,
             anim_t: 0.0,
+            hover_timer: 0.0,
             leave_timer: 0.0,
+            monitor_h: 900.0,
+            initialized: false,
+            drop_grace: 0.0,
         }
     }
 
+    // ── Channel polling ───────────────────────────────────────────────────
     fn poll(&mut self) {
         while let Ok(item) = self.recv_rx.try_recv() {
             self.items.push(match item {
@@ -66,8 +93,10 @@ impl SShareApp {
         }
     }
 
+    // ── Drop / paste handling ─────────────────────────────────────────────
     fn handle_input(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
+            // Ctrl+V / Cmd+V  (only useful in Full)
             for ev in &i.events {
                 if let egui::Event::Paste(text) = ev {
                     if !text.is_empty() {
@@ -76,6 +105,7 @@ impl SShareApp {
                     }
                 }
             }
+            // File drag-and-drop (works in Mini too)
             for f in &i.raw.dropped_files {
                 if let Some(path) = &f.path {
                     if let Ok(data) = std::fs::read(path) {
@@ -95,176 +125,295 @@ impl SShareApp {
         });
     }
 
-    /// Drive the show/hide animation and update the OS window geometry.
-    fn update_animation(&mut self, ctx: &egui::Context) {
+    // ── State machine + viewport commands ────────────────────────────────
+    fn update_phase(&mut self, ctx: &egui::Context) {
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
         let cursor_in = ctx.input(|i| i.pointer.has_pointer());
+        let clicked = ctx.input(|i| i.pointer.primary_clicked());
 
-        if cursor_in {
-            self.leave_timer = 0.0;
-            self.anim_t = (self.anim_t + dt * ANIM_SPEED).min(1.0);
+        if let Some(sz) = ctx.input(|i| i.viewport().monitor_size) {
+            self.monitor_h = sz.y;
+        }
+
+        let prev_phase = self.phase;
+
+        // After a drop, macOS takes a moment to transition from drag-session
+        // tracking back to normal pointer tracking.  Keep a grace timer so the
+        // window doesn't collapse in that gap.
+        let file_just_dropped = ctx.input(|i| !i.raw.dropped_files.is_empty());
+        if file_just_dropped {
+            self.drop_grace = 0.6;
         } else {
-            self.leave_timer += dt;
-            if self.leave_timer >= LEAVE_DELAY {
-                self.anim_t = (self.anim_t - dt * ANIM_SPEED).max(0.0);
+            self.drop_grace = (self.drop_grace - dt).max(0.0);
+        }
+
+        // During a drag, macOS replaces normal pointer tracking with a drag
+        // session so has_pointer() can be false even when the cursor is over
+        // the window. Treat hovered_files / drop grace as "cursor present".
+        let file_dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let present = cursor_in || file_dragging || self.drop_grace > 0.0;
+
+        // ── Step 1: input-driven transitions ──────────────────────────────
+        match self.phase {
+            Phase::Hidden => {
+                if present {
+                    self.phase = Phase::Mini;
+                    self.hover_timer = 0.0;
+                }
+            }
+            Phase::Mini => {
+                if present {
+                    self.hover_timer += dt;
+                    // File drag → expand immediately without dwell wait.
+                    if file_dragging || self.hover_timer >= HOVER_TO_EXPAND_SECS || clicked {
+                        self.phase = Phase::Expanding;
+                    }
+                } else {
+                    self.phase = Phase::Hidden;
+                    self.hover_timer = 0.0;
+                }
+            }
+            Phase::Full => {
+                if present {
+                    self.leave_timer = 0.0;
+                } else {
+                    self.leave_timer += dt;
+                    if self.leave_timer >= LEAVE_TO_HIDE_SECS {
+                        self.phase = Phase::Collapsing;
+                    }
+                }
+            }
+            // Expanding / Collapsing complete via animation below.
+            Phase::Expanding | Phase::Collapsing => {}
+        }
+
+        // ── Step 2: advance anim_t, request repaint every animation frame ──
+        match self.phase {
+            Phase::Expanding => {
+                self.anim_t = (self.anim_t + dt / EXPAND_SECS).min(1.0);
+                ctx.request_repaint();
+                if self.anim_t >= 1.0 {
+                    self.phase = Phase::Full;
+                    self.leave_timer = 0.0;
+                }
+            }
+            Phase::Collapsing => {
+                self.anim_t = (self.anim_t - dt / COLLAPSE_SECS).max(0.0);
+                ctx.request_repaint();
+                if self.anim_t <= 0.0 {
+                    self.phase = Phase::Hidden;
+                }
+            }
+            _ => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(80));
             }
         }
 
-        // Keep repainting while animating or while the collapse delay is ticking.
-        let animating = self.anim_t > 0.001 && self.anim_t < 0.999;
-        let waiting = !cursor_in && self.leave_timer < LEAVE_DELAY && self.anim_t > 0.001;
-        if animating || waiting {
-            ctx.request_repaint();
-        } else {
-            // Still poll channels while idle.
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // ── Viewport commands ─────────────────────────────────────────────
+        // KEY INSIGHT (same as macOS Dock): never resize during animation.
+        // The window is always FULL_W×FULL_H when visible; only OuterPosition
+        // (Y) changes each frame.  Position changes are composited by the GPU
+        // and are smooth even at high frame rates.  InnerSize changes go
+        // through the window server and cause the observed jank.
+        let animating = matches!(self.phase, Phase::Expanding | Phase::Collapsing);
+
+        // Resize only when crossing the Hidden boundary (once per show/hide).
+        let size_changed = !self.initialized
+            || (prev_phase == Phase::Hidden) != (self.phase == Phase::Hidden);
+        if size_changed {
+            let (w, h) = self.window_size();
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
         }
 
-        // Compute current geometry with an ease-out curve.
-        let t = ease_out_cubic(self.anim_t);
-        let w = TAB_W + (FULL_W - TAB_W) * t;
-        let h = TAB_H + (FULL_H - TAB_H) * t;
+        // Position every frame while animating; once on state transitions.
+        if !self.initialized || self.phase != prev_phase || animating {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                self.window_pos(),
+            ));
+            self.initialized = true;
+        }
+    }
 
-        // Anchor to bottom-left of the monitor.
-        let monitor_h = ctx
-            .input(|i| i.viewport().monitor_size)
-            .unwrap_or(egui::vec2(1440.0, 900.0))
-            .y;
+    /// Window size: small transparent hotspot when Hidden, full otherwise.
+    fn window_size(&self) -> (f32, f32) {
+        if self.phase == Phase::Hidden {
+            (MINI_W, MINI_H)
+        } else {
+            (FULL_W, FULL_H)
+        }
+    }
 
-        let pos = egui::pos2(0.0, monitor_h - h);
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+    /// Window Y-only animation — no width change ever during animation.
+    fn window_pos(&self) -> egui::Pos2 {
+        // Collapsed Y: window top sits at (monitor_h − MINI_H) so only the
+        // top MINI_H pixels are on-screen (the "mini strip").
+        // Expanded Y: window top at (monitor_h − FULL_H), fully on-screen.
+        let y_collapsed = self.monitor_h - MINI_H;
+        let y_expanded  = self.monitor_h - FULL_H;
+
+        let y = match self.phase {
+            Phase::Hidden => self.monitor_h - MINI_H,
+            Phase::Mini   => y_collapsed,
+            Phase::Expanding => {
+                let t = ease_out_cubic(self.anim_t);
+                lerp(y_collapsed, y_expanded, t)
+            }
+            Phase::Full => y_expanded,
+            Phase::Collapsing => {
+                let t = ease_in_cubic(self.anim_t); // 1 → 0
+                lerp(y_collapsed, y_expanded, t)
+            }
+        };
+        egui::pos2(0.0, y)
     }
 }
 
+// ── eframe::App ───────────────────────────────────────────────────────────────
 impl eframe::App for SShareApp {
-    // Transparent clear colour lets the egui fill colour be the actual background.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0; 4]
+    fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
+        // Hidden: fully transparent window (invisible hotspot).
+        if self.phase == Phase::Hidden {
+            [0.0; 4]
+        } else {
+            let c = egui::Color32::from_rgb(28, 28, 34);
+            [
+                c.r() as f32 / 255.0,
+                c.g() as f32 / 255.0,
+                c.b() as f32 / 255.0,
+                1.0,
+            ]
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
         self.handle_input(ctx);
-        self.update_animation(ctx);
+        self.update_phase(ctx);
 
-        let t = ease_out_cubic(self.anim_t);
-        let cur_w = TAB_W + (FULL_W - TAB_W) * t;
-
-        // ── Panel background (rounded left side only when expanded) ──────────
-        let bg = egui::Color32::from_rgb(30, 30, 35);
-        let panel_frame = egui::Frame::none()
-            .fill(bg)
-            .rounding(egui::Rounding {
-                nw: 0.0,
-                sw: 0.0,
-                ne: if t > 0.05 { 10.0 } else { 0.0 },
-                se: if t > 0.05 { 10.0 } else { 0.0 },
-            })
-            .inner_margin(if cur_w > TAB_W + 20.0 {
-                egui::Margin::symmetric(8.0, 6.0)
-            } else {
-                egui::Margin::symmetric(0.0, 0.0)
-            });
-
-        egui::CentralPanel::default()
-            .frame(panel_frame)
-            .show(ctx, |ui| {
-                // ── Collapsed tab view ─────────────────────────────────────
-                if cur_w < TAB_W + 20.0 {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new("≡")
-                                .size(18.0)
-                                .color(egui::Color32::from_gray(200)),
-                        );
-                        ui.add_space(6.0);
-                        // Connection status dot
-                        let dot_color = if self.status.starts_with("Connected") {
-                            egui::Color32::from_rgb(50, 210, 100)
-                        } else {
-                            egui::Color32::from_rgb(220, 180, 40)
-                        };
-                        ui.colored_label(dot_color, "●");
-                    });
-                    return;
-                }
-
-                // ── Expanded view ──────────────────────────────────────────
-
-                // Fade in content after the window is wide enough.
-                let content_alpha = ((cur_w - TAB_W - 20.0) / 60.0).clamp(0.0, 1.0);
-                let fade = |base: egui::Color32| -> egui::Color32 {
-                    egui::Color32::from_rgba_unmultiplied(
-                        base.r(), base.g(), base.b(),
-                        (base.a() as f32 * content_alpha) as u8,
+        match self.phase {
+            // ── Hidden: near-transparent hotspot ──────────────────────────
+            // On macOS a fully transparent window may not receive pointer
+            // events, so fill with 1/255 alpha — visually invisible but
+            // keeps the window hittable.
+            Phase::Hidden => {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 1)),
                     )
+                    .show(ctx, |_| {});
+            }
+
+            // ── Mini / Expanding / Full / Collapsing ───────────────────────
+            // All share one 350×520 window.  In Mini the window is positioned
+            // so only the top MINI_H px are on-screen — exactly like the Dock.
+            // Animation slides the Y position; no resize occurs mid-animation.
+            Phase::Mini | Phase::Expanding | Phase::Full | Phase::Collapsing => {
+                let hovering_file = ctx.input(|i| !i.raw.hovered_files.is_empty());
+                let hover_progress = (self.hover_timer / HOVER_TO_EXPAND_SECS).clamp(0.0, 1.0);
+                let dot_color = if self.status.starts_with("Connected") {
+                    egui::Color32::from_rgb(50, 210, 100)
+                } else {
+                    egui::Color32::from_rgb(220, 180, 40)
                 };
 
-                // Status bar
-                ui.horizontal(|ui| {
-                    let connected = self.status.starts_with("Connected");
-                    let dot_color = if connected {
-                        egui::Color32::from_rgb(50, 210, 100)
-                    } else {
-                        egui::Color32::from_rgb(220, 180, 40)
-                    };
-                    ui.colored_label(fade(dot_color), "●");
-                    ui.label(
-                        egui::RichText::new(&self.status)
-                            .size(11.0)
-                            .color(fade(egui::Color32::from_gray(190))),
+                let frame = egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(28, 28, 34))
+                    .rounding(egui::Rounding { nw: 0.0, sw: 0.0, ne: 10.0, se: 0.0 })
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0));
+
+                egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+                    // ── Top strip (always visible in Mini) ─────────────────
+                    // Height = MINI_H.  Shows icon + progress ring + status dot.
+                    let strip_rect = egui::Rect::from_min_size(
+                        ui.min_rect().min,
+                        egui::vec2(ui.available_width(), MINI_H - 12.0),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Close button
-                        if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new("✕")
-                                    .size(11.0)
-                                    .color(fade(egui::Color32::from_gray(160))),
-                            ).frame(false))
-                            .clicked()
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new("Clear")
-                                    .size(11.0)
-                                    .color(fade(egui::Color32::from_gray(160))),
-                            ).frame(false))
-                            .clicked()
-                        {
-                            self.items.clear();
-                        }
+                    let center = strip_rect.center();
+                    let radius = 20.0;
+
+                    // Background ring
+                    ui.painter().circle_stroke(
+                        center, radius,
+                        egui::Stroke::new(2.0, egui::Color32::from_gray(55)),
+                    );
+                    // Progress arc (fill as hover_timer advances toward expand)
+                    let arc_alpha = (200.0 * hover_progress) as u8;
+                    let arc_color = egui::Color32::from_rgba_premultiplied(80, 160, 255, arc_alpha);
+                    let segs = 32usize;
+                    for seg in 0..(segs as f32 * hover_progress) as usize {
+                        let a0 = std::f32::consts::TAU * seg as f32 / segs as f32
+                            - std::f32::consts::FRAC_PI_2;
+                        let a1 = std::f32::consts::TAU * (seg + 1) as f32 / segs as f32
+                            - std::f32::consts::FRAC_PI_2;
+                        ui.painter().line_segment(
+                            [center + egui::vec2(a0.cos(), a0.sin()) * radius,
+                             center + egui::vec2(a1.cos(), a1.sin()) * radius],
+                            egui::Stroke::new(2.5, arc_color),
+                        );
+                    }
+                    // Icon
+                    ui.painter().text(
+                        center - egui::vec2(0.0, 3.0),
+                        egui::Align2::CENTER_CENTER,
+                        if hovering_file { "📥" } else { "⬆" },
+                        egui::FontId::proportional(20.0),
+                        egui::Color32::from_gray(210),
+                    );
+                    // Status dot
+                    ui.painter().circle_filled(
+                        center + egui::vec2(12.0, 10.0), 4.0, dot_color,
+                    );
+
+                    // Allocate space so egui knows we used the strip.
+                    ui.allocate_rect(strip_rect, egui::Sense::hover());
+
+                    // ── Below-strip content (only visible once window rises) ─
+                    ui.separator();
+
+                    // Header bar
+                    ui.horizontal(|ui| {
+                        ui.colored_label(dot_color, "●");
+                        ui.label(
+                            egui::RichText::new(&self.status)
+                                .size(11.0)
+                                .color(egui::Color32::from_gray(180)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new(
+                                egui::RichText::new("✕").size(11.0)
+                                    .color(egui::Color32::from_gray(150)),
+                            ).frame(false)).clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            if ui.add(egui::Button::new(
+                                egui::RichText::new("Clear").size(11.0)
+                                    .color(egui::Color32::from_gray(150)),
+                            ).frame(false)).clicked() {
+                                self.items.clear();
+                            }
+                        });
                     });
-                });
+                    ui.separator();
 
-                ui.add(egui::Separator::default());
-
-                // Items list
-                let list_height = ui.available_height() - 64.0;
-                egui::ScrollArea::vertical()
-                    .max_height(list_height)
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        let mut remove_idx: Option<usize> = None;
-                        for (i, item) in self.items.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                match item {
+                    // Items list
+                    let list_h = ui.available_height() - 62.0;
+                    egui::ScrollArea::vertical()
+                        .max_height(list_h)
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            let mut remove: Option<usize> = None;
+                            for (i, item) in self.items.iter().enumerate() {
+                                ui.horizontal(|ui| match item {
                                     Item::Text(t) => {
                                         ui.label(
                                             egui::RichText::new(format!("📝 {}", truncate(t, 46)))
-                                                .size(12.0)
-                                                .color(fade(egui::Color32::from_gray(220))),
+                                                .size(12.0).color(egui::Color32::from_gray(220)),
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if ui.small_button("✕").clicked() {
-                                                    remove_idx = Some(i);
-                                                }
+                                                if ui.small_button("✕").clicked() { remove = Some(i); }
                                                 if ui.small_button("Copy").clicked() {
                                                     if let Some(cb) = &mut self.clipboard {
                                                         let _ = cb.set_text(t.clone());
@@ -275,87 +424,73 @@ impl eframe::App for SShareApp {
                                     }
                                     Item::File { name, data } => {
                                         ui.label(
-                                            egui::RichText::new(format!(
-                                                "📎 {}  ({})",
-                                                name,
-                                                fmt_size(data.len())
-                                            ))
-                                            .size(12.0)
-                                            .color(fade(egui::Color32::from_gray(220))),
+                                            egui::RichText::new(format!("📎 {} ({})", name, fmt_size(data.len())))
+                                                .size(12.0).color(egui::Color32::from_gray(220)),
                                         );
-                                        let data = data.clone();
-                                        let name = name.clone();
+                                        let (name, data) = (name.clone(), data.clone());
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if ui.small_button("✕").clicked() {
-                                                    remove_idx = Some(i);
-                                                }
-                                                if ui.small_button("Save").clicked() {
-                                                    save_file(&name, &data);
-                                                }
+                                                if ui.small_button("✕").clicked() { remove = Some(i); }
+                                                if ui.small_button("Save").clicked() { save_file(&name, &data); }
                                             },
                                         );
                                     }
-                                }
-                            });
-                            ui.separator();
-                        }
+                                });
+                                ui.separator();
+                            }
+                            if self.items.is_empty() {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.label(egui::RichText::new("No shared items yet.")
+                                        .size(12.0).color(egui::Color32::from_gray(100)));
+                                });
+                            }
+                            if let Some(i) = remove { self.items.remove(i); }
+                        });
 
-                        if self.items.is_empty() {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(16.0);
-                                ui.label(
-                                    egui::RichText::new("No shared items yet.")
-                                        .size(12.0)
-                                        .color(fade(egui::Color32::from_gray(110))),
-                                );
-                            });
-                        }
-
-                        if let Some(i) = remove_idx {
-                            self.items.remove(i);
-                        }
-                    });
-
-                // Drop zone
-                ui.add(egui::Separator::default());
-                let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), ui.available_height()),
-                    egui::Sense::hover(),
-                );
-                let drop_bg = if hovering {
-                    fade(egui::Color32::from_rgba_premultiplied(30, 100, 230, 55))
-                } else {
-                    fade(egui::Color32::from_rgba_premultiplied(80, 80, 80, 25))
-                };
-                let border_col = if hovering {
-                    fade(egui::Color32::from_rgb(80, 160, 255))
-                } else {
-                    fade(egui::Color32::from_gray(80))
-                };
-                ui.painter()
-                    .rect(rect, 6.0, drop_bg, egui::Stroke::new(1.5, border_col));
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    if hovering {
-                        "Drop to share →"
+                    // Drop zone
+                    ui.separator();
+                    let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), ui.available_height()),
+                        egui::Sense::hover(),
+                    );
+                    let bg = if hovering {
+                        egui::Color32::from_rgba_premultiplied(30, 100, 230, 55)
                     } else {
-                        "Drop files here  •  Ctrl+V to paste"
-                    },
-                    egui::FontId::proportional(12.0),
-                    fade(egui::Color32::from_gray(140)),
-                );
-            });
+                        egui::Color32::from_rgba_premultiplied(80, 80, 80, 25)
+                    };
+                    let border = if hovering {
+                        egui::Color32::from_rgb(80, 160, 255)
+                    } else {
+                        egui::Color32::from_gray(75)
+                    };
+                    ui.painter().rect(rect, 6.0, bg, egui::Stroke::new(1.5, border));
+                    ui.painter().text(
+                        rect.center(), egui::Align2::CENTER_CENTER,
+                        if hovering { "Drop to share →" } else { "Drop files  •  Ctrl+V to paste" },
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_gray(130),
+                    );
+                });
+            }
+        }
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
 
 fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
+}
+
+fn ease_in_cubic(t: f32) -> f32 {
+    t * t * t
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -412,7 +547,6 @@ fn load_japanese_font(ctx: &egui::Context) {
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf",
-        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
     ];
     if let Some(data) = candidates.iter().find_map(|p| std::fs::read(p).ok()) {
         let mut fonts = egui::FontDefinitions::default();

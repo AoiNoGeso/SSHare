@@ -44,10 +44,10 @@ fn main() -> eframe::Result {
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("SShare")
-                // Start as the collapsed tab size; app.rs resizes dynamically.
-                .with_inner_size([app::TAB_W, app::TAB_H])
-                .with_min_inner_size([app::TAB_W, app::TAB_H])
+                .with_inner_size([app::MINI_W, app::MINI_H])
+                .with_min_inner_size([app::MINI_W, app::MINI_H])
                 .with_decorations(false)
+                .with_transparent(true)
                 .with_always_on_top(),
             ..Default::default()
         },
