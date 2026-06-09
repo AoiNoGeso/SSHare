@@ -49,8 +49,7 @@ pub struct SShareApp {
     hover_timer: f32,
     leave_timer: f32,
     monitor_h: f32,
-    calib_bottom: f32, // actual screen bottom in virtual-desktop coords (0 = not yet calibrated)
-    calib_frames: u8,  // frames elapsed since probe was sent
+    calib_bottom: f32, // actual screen bottom in virtual-desktop coords (0 = use monitor_h)
     initialized: bool,
     drop_grace: f32,
 
@@ -108,8 +107,7 @@ impl SShareApp {
             hover_timer: 0.0,
             leave_timer: 0.0,
             monitor_h: 900.0,
-            calib_bottom: 0.0,
-            calib_frames: 0,
+            calib_bottom: linux_monitor_bottom(),
             initialized: false,
             drop_grace: 0.0,
             net_setup_tx,
@@ -357,8 +355,6 @@ impl SShareApp {
 
         self.phase = Phase::Hidden;
         self.initialized = false;
-        self.calib_bottom = 0.0;
-        self.calib_frames = 0;
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
@@ -418,64 +414,13 @@ impl SShareApp {
 
     // ── State machine + viewport commands ────────────────────────────────
     fn update_phase(&mut self, ctx: &egui::Context) {
-        // Always refresh monitor_h first so calibration fallback is accurate.
+        let dt = ctx.input(|i| i.stable_dt).min(0.05);
+        let cursor_in = ctx.input(|i| i.pointer.has_pointer());
+
         let prev_monitor_h = self.monitor_h;
         if let Some(sz) = ctx.input(|i| i.viewport().monitor_size) {
             self.monitor_h = sz.y;
         }
-
-        // Self-calibrate the actual virtual-desktop bottom for this monitor.
-        // We send the window to a huge Y, wait 3 frames for the WM to constrain it,
-        // then read back outer_rect.min.y to find where the WM placed the bottom edge.
-        // This handles multi-monitor setups where the monitor has a non-zero Y offset.
-        if self.calib_bottom == 0.0 {
-            match self.calib_frames {
-                0 => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                        egui::vec2(MINI_W, MINI_H),
-                    ));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                        egui::pos2(0.0, 99999.0),
-                    ));
-                    ctx.request_repaint();
-                    self.calib_frames = 1;
-                    return;
-                }
-                1 | 2 => {
-                    ctx.request_repaint();
-                    self.calib_frames += 1;
-                    return;
-                }
-                _ => {
-                    let bottom = ctx
-                        .input(|i| i.viewport().outer_rect)
-                        .map(|r| r.min.y + MINI_H);
-                    if let Some(b) = bottom {
-                        if b > self.monitor_h * 0.3 {
-                            self.calib_bottom = b;
-                            self.initialized = false;
-                            eprintln!("[SShare] calib_bottom={b:.0}");
-                        }
-                    }
-                    if self.calib_bottom == 0.0 {
-                        // WM hasn't responded yet; keep waiting (up to 15 frames then fall back)
-                        if self.calib_frames < 15 {
-                            ctx.request_repaint();
-                            self.calib_frames += 1;
-                        } else {
-                            self.calib_bottom = self.monitor_h;
-                            self.initialized = false;
-                            eprintln!("[SShare] calib_bottom fallback={}", self.monitor_h);
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-
-        let dt = ctx.input(|i| i.stable_dt).min(0.05);
-        let cursor_in = ctx.input(|i| i.pointer.has_pointer());
-
         let monitor_changed = (self.monitor_h - prev_monitor_h).abs() > 0.5;
 
         let prev_phase = self.phase;
@@ -921,6 +866,49 @@ fn text_btn(ui: &mut egui::Ui, label: &str) -> bool {
         },
     );
     resp.clicked()
+}
+
+/// Return the virtual-desktop Y coordinate of the bottom edge of the monitor at x=0.
+/// On non-Linux, or if xrandr fails, returns 0.0 (caller falls back to monitor_h).
+fn linux_monitor_bottom() -> f32 {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(out) = std::process::Command::new("xrandr").output() else {
+            return 0.0;
+        };
+        let s = String::from_utf8_lossy(&out.stdout);
+        for line in s.lines() {
+            if !line.contains(" connected") {
+                continue;
+            }
+            // Geometry token looks like "3440x1440+0+196"
+            let Some(geom) = line.split_whitespace().find(|t| {
+                t.contains('x') && t.contains('+') && !t.starts_with('(')
+            }) else {
+                continue;
+            };
+            // Parse "WxH+X+Y" → [W, H, X, Y]
+            let nums: Vec<f32> = geom
+                .replace('x', "+")
+                .split('+')
+                .filter_map(|t| t.parse().ok())
+                .collect();
+            if nums.len() >= 4 && nums[2] == 0.0 {
+                // This is the monitor whose left edge is at x=0.
+                let bottom = nums[3] + nums[1]; // y_offset + height
+                eprintln!(
+                    "[SShare] xrandr monitor@x=0: y_offset={} h={} → bottom={}",
+                    nums[3], nums[1], bottom
+                );
+                return bottom;
+            }
+        }
+        0.0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0.0
+    }
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
