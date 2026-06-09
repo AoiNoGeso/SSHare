@@ -418,6 +418,14 @@ impl SShareApp {
         if let Some(sz) = ctx.input(|i| i.viewport().monitor_size) {
             self.monitor_h = sz.y;
         }
+        // On Linux, the taskbar eats into the bottom of the screen.
+        // Use _NET_WORKAREA to find the actual usable bottom edge (once, on first frame).
+        #[cfg(target_os = "linux")]
+        if !self.initialized {
+            if let Some(bottom) = linux_workarea_bottom() {
+                self.monitor_h = bottom;
+            }
+        }
 
         let prev_phase = self.phase;
 
@@ -865,6 +873,30 @@ fn text_btn(ui: &mut egui::Ui, label: &str) -> bool {
         },
     );
     resp.clicked()
+}
+
+/// Query the X11 _NET_WORKAREA property to find the bottom of the usable desktop
+/// area, excluding taskbars/panels. Returns None on failure or non-Linux platforms.
+#[cfg(target_os = "linux")]
+fn linux_workarea_bottom() -> Option<f32> {
+    let out = std::process::Command::new("xprop")
+        .args(["-root", "_NET_WORKAREA"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8(out.stdout).ok()?;
+    // Output format: "_NET_WORKAREA(CARDINAL) = 0, 0, 1920, 1032"
+    // Four values per virtual desktop: x, y, width, height
+    let after_eq = s.split('=').nth(1)?;
+    let nums: Vec<f32> = after_eq
+        .split(',')
+        .filter_map(|n| n.trim().parse().ok())
+        .collect();
+    // nums[1] = y offset (e.g. top panel height), nums[3] = usable height
+    if nums.len() >= 4 {
+        Some(nums[1] + nums[3])
+    } else {
+        None
+    }
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
