@@ -423,17 +423,18 @@ impl SShareApp {
         }
         let monitor_changed = (self.monitor_h - prev_monitor_h).abs() > 0.5;
 
-        // Debug: track actual window position over first 10 frames
+        // Debug: track actual position over first 60 frames and on phase change
+        let prev_debug_phase = self.phase;
         self.debug_frame += 1;
-        if self.debug_frame <= 10 {
-            let outer = ctx.input(|i| i.viewport().outer_rect);
-            let scale = ctx.pixels_per_point();
+        let outer_y = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min.y));
+        if self.debug_frame <= 60 || monitor_changed {
             eprintln!(
-                "[SShare f{:02}] monitor_h={:.0}  scale={:.2}  \
-                 actual_outer={:?}  target_y={:.0}",
-                self.debug_frame, self.monitor_h, scale,
-                outer.map(|r| r.min),
-                self.monitor_h - MINI_H
+                "[SShare f{:03} {:?}] monitor_h={:.0}  outer_y={:?}  target_y={:.0}",
+                self.debug_frame,
+                prev_debug_phase,
+                self.monitor_h,
+                outer_y,
+                self.monitor_h - MINI_H,
             );
         }
 
