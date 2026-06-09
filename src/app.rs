@@ -49,6 +49,8 @@ pub struct SShareApp {
     hover_timer: f32,
     leave_timer: f32,
     monitor_h: f32,
+    calib_bottom: f32, // actual screen bottom in virtual-desktop coords (0 = not yet calibrated)
+    calib_frames: u8,  // frames elapsed since probe was sent
     initialized: bool,
     drop_grace: f32,
 
@@ -106,6 +108,8 @@ impl SShareApp {
             hover_timer: 0.0,
             leave_timer: 0.0,
             monitor_h: 900.0,
+            calib_bottom: 0.0,
+            calib_frames: 0,
             initialized: false,
             drop_grace: 0.0,
             net_setup_tx,
@@ -353,6 +357,8 @@ impl SShareApp {
 
         self.phase = Phase::Hidden;
         self.initialized = false;
+        self.calib_bottom = 0.0;
+        self.calib_frames = 0;
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
@@ -412,13 +418,64 @@ impl SShareApp {
 
     // ── State machine + viewport commands ────────────────────────────────
     fn update_phase(&mut self, ctx: &egui::Context) {
-        let dt = ctx.input(|i| i.stable_dt).min(0.05);
-        let cursor_in = ctx.input(|i| i.pointer.has_pointer());
-
+        // Always refresh monitor_h first so calibration fallback is accurate.
         let prev_monitor_h = self.monitor_h;
         if let Some(sz) = ctx.input(|i| i.viewport().monitor_size) {
             self.monitor_h = sz.y;
         }
+
+        // Self-calibrate the actual virtual-desktop bottom for this monitor.
+        // We send the window to a huge Y, wait 3 frames for the WM to constrain it,
+        // then read back outer_rect.min.y to find where the WM placed the bottom edge.
+        // This handles multi-monitor setups where the monitor has a non-zero Y offset.
+        if self.calib_bottom == 0.0 {
+            match self.calib_frames {
+                0 => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                        egui::vec2(MINI_W, MINI_H),
+                    ));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                        egui::pos2(0.0, 99999.0),
+                    ));
+                    ctx.request_repaint();
+                    self.calib_frames = 1;
+                    return;
+                }
+                1 | 2 => {
+                    ctx.request_repaint();
+                    self.calib_frames += 1;
+                    return;
+                }
+                _ => {
+                    let bottom = ctx
+                        .input(|i| i.viewport().outer_rect)
+                        .map(|r| r.min.y + MINI_H);
+                    if let Some(b) = bottom {
+                        if b > self.monitor_h * 0.3 {
+                            self.calib_bottom = b;
+                            self.initialized = false;
+                            eprintln!("[SShare] calib_bottom={b:.0}");
+                        }
+                    }
+                    if self.calib_bottom == 0.0 {
+                        // WM hasn't responded yet; keep waiting (up to 15 frames then fall back)
+                        if self.calib_frames < 15 {
+                            ctx.request_repaint();
+                            self.calib_frames += 1;
+                        } else {
+                            self.calib_bottom = self.monitor_h;
+                            self.initialized = false;
+                            eprintln!("[SShare] calib_bottom fallback={}", self.monitor_h);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        let dt = ctx.input(|i| i.stable_dt).min(0.05);
+        let cursor_in = ctx.input(|i| i.pointer.has_pointer());
+
         let monitor_changed = (self.monitor_h - prev_monitor_h).abs() > 0.5;
 
         let prev_phase = self.phase;
@@ -518,7 +575,8 @@ impl SShareApp {
 
     fn window_pos(&self) -> egui::Pos2 {
         let (_, h) = self.window_size();
-        egui::pos2(0.0, self.monitor_h - h)
+        let bottom = if self.calib_bottom > 0.0 { self.calib_bottom } else { self.monitor_h };
+        egui::pos2(0.0, bottom - h)
     }
 }
 
