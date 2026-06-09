@@ -49,10 +49,8 @@ pub struct SShareApp {
     hover_timer: f32,
     leave_timer: f32,
     monitor_h: f32,
-    panel_bottom: f32, // cached _NET_WORKAREA bottom (Linux) or 0 = use monitor_h
     initialized: bool,
     drop_grace: f32,
-    dbg_frame: u32,
 
     // ── Setup wizard state ──────────────────────────────────────────────────
     net_setup_tx: Option<mpsc::Sender<Config>>,
@@ -108,15 +106,8 @@ impl SShareApp {
             hover_timer: 0.0,
             leave_timer: 0.0,
             monitor_h: 900.0,
-            panel_bottom: {
-                #[cfg(target_os = "linux")]
-                { workarea_bottom().unwrap_or(0.0) }
-                #[cfg(not(target_os = "linux"))]
-                { 0.0 }
-            },
             initialized: false,
             drop_grace: 0.0,
-            dbg_frame: 0,
             net_setup_tx,
             setup_mode: ConfigMode::Server,
             setup_port: "7878".into(),
@@ -502,14 +493,6 @@ impl SShareApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.window_pos()));
             self.initialized = true;
         }
-        // Debug: print outer_y every 60 frames to confirm actual window position
-        self.dbg_frame += 1;
-        if self.dbg_frame % 60 == 1 {
-            let outer_y = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min.y));
-            let (_, h) = self.window_size();
-            eprintln!("[SShare {:?}] outer_y={:?}  sent_y={:.0}  monitor_h={:.0}",
-                self.phase, outer_y, self.monitor_h - h, self.monitor_h);
-        }
         // Transparent windows are click-through by default; opt back in for the hidden hotspot.
         if prev_phase != Phase::Hidden && self.phase == Phase::Hidden {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
@@ -535,15 +518,7 @@ impl SShareApp {
 
     fn window_pos(&self) -> egui::Pos2 {
         let (_, h) = self.window_size();
-        egui::pos2(0.0, self.effective_bottom() - h)
-    }
-
-    fn effective_bottom(&self) -> f32 {
-        if self.panel_bottom > 0.0 {
-            self.panel_bottom
-        } else {
-            self.monitor_h
-        }
+        egui::pos2(0.0, self.monitor_h - h)
     }
 }
 
@@ -888,31 +863,6 @@ fn text_btn(ui: &mut egui::Ui, label: &str) -> bool {
         },
     );
     resp.clicked()
-}
-
-/// On Linux: query `_NET_WORKAREA` via xprop to find the actual usable screen bottom.
-/// Returns None if xprop is unavailable or parsing fails (caller falls back to monitor_h).
-#[cfg(target_os = "linux")]
-fn workarea_bottom() -> Option<f32> {
-    let out = std::process::Command::new("xprop")
-        .args(["-root", "_NET_WORKAREA"])
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    // "_NET_WORKAREA(CARDINAL) = 0, 0, 3440, 1392\n"
-    let after_eq = s.split('=').nth(1)?;
-    let nums: Vec<f32> = after_eq
-        .split(',')
-        .filter_map(|t| t.trim().parse().ok())
-        .collect();
-    // layout: x, y, width, height  (repeated per virtual desktop)
-    if nums.len() >= 4 {
-        let bottom = nums[1] + nums[3];
-        eprintln!("[SShare] _NET_WORKAREA bottom={bottom} (y={} h={})", nums[1], nums[3]);
-        Some(bottom)
-    } else {
-        None
-    }
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
